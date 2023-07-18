@@ -2,8 +2,13 @@ package main
 
 import (
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"math"
 	"os"
+	"os/exec"
+	"strconv"
 
 	vidio "github.com/AlexEidt/Vidio"
 )
@@ -26,7 +31,35 @@ var bayer = [16][16]int{
 	{42, 233, 26, 217, 38, 229, 22, 213, 41, 232, 25, 216, 37, 228, 21, 212},
 	{169, 106, 153, 90, 165, 102, 149, 86, 168, 105, 152, 89, 164, 101, 148, 85}}
 
+type byteSliceAsImage interface {
+	ColorModel() color.Model
+	Bounds() image.Rectangle
+	At(x, y int) color.Color
+}
+
+type ImageData struct {
+	ImageContents []byte
+	ImageWidth    int
+}
+
+func (img ImageData) ColorModel() color.Model { return color.RGBAModel }
+
+func (img ImageData) Bounds() image.Rectangle {
+	width := img.ImageWidth
+	height := len(img.ImageContents) / 4 / width
+	rect := image.Rectangle{image.Point{0, 0}, image.Point{width, height}}
+	return rect
+}
+
+func (img ImageData) At(x, y int) color.Color {
+	point := y*img.ImageWidth + x
+	var color color.Color = color.RGBA{uint8(img.ImageContents[point*4]), uint8(img.ImageContents[point*4+1]), uint8(img.ImageContents[point*4+2]), uint8(255)}
+	return color
+}
+
 func main() {
+	var scale int
+	var err error
 	switch len(os.Args) {
 	case 1:
 		fmt.Println("Error: no input/output paths provided")
@@ -34,32 +67,38 @@ func main() {
 	case 2:
 		fmt.Println("Error: no output path provided")
 		os.Exit(1)
+	case 3:
+		fmt.Println("Warning: no scale provided, using 1x")
+		scale = 1
+	default:
+		scale, err = strconv.Atoi(os.Args[3])
+		if err != nil {
+			fmt.Println("Scale must be an integer")
+			os.Exit(1)
+		}
 	}
 	path := os.Args[1]
 	out := os.Args[2]
+
 	video, err := vidio.NewVideo(path)
 	if err != nil {
 		fmt.Println("error", err)
 	}
-	options := vidio.Options{
-		FPS:     video.FPS(),
-		Bitrate: video.Bitrate(),
-		Codec:   video.Codec(),
-	}
 	width := video.Width()
-	framesCount := int(video.Duration() * video.FPS())
-	writer, err := vidio.NewVideoWriter(
-		out,
-		width,
-		video.Height(),
-		&options,
-	)
-
-	defer writer.Close()
+	framesCount := int(math.Ceil(video.Duration() * video.FPS()))
 	leng := width * video.Height() * 4
-	frC := 0
+	frCounter := 0
+	img := image.NewRGBA(image.Rect(0, 0, video.Width(), video.Height()))
+	video.SetFrameBuffer(img.Pix)
+	if err := os.Mkdir("temp", os.ModePerm); err != nil {
+		fmt.Println("\n", err)
+		os.Exit(1)
+	}
 	for video.Read() {
+
+		f, _ := os.Create(fmt.Sprintf("./temp/%05d.jpg", frCounter))
 		frame := video.FrameBuffer()
+
 		var newFrame []byte
 		x := 0
 		y := 0
@@ -79,12 +118,31 @@ func main() {
 				x = 0
 			}
 		}
-
-		frC++
-		writer.Write(newFrame)
-		fmt.Printf("\033[2K\r%d/%d", frC, framesCount)
+		frCounter++
+		var newImage byteSliceAsImage = ImageData{newFrame, width}
+		jpeg.Encode(f, newImage, nil)
+		fmt.Printf("\033[2K\r%d/%d", frCounter, framesCount)
 	}
-	fmt.Println("\nSuccess")
+
+	scaleStr := fmt.Sprintf("scale=%d*iw:%d*ih:flags=neighbor", scale, scale)
+	f := (math.Round(video.FPS()))
+	run := exec.Command("ffmpeg", "-framerate", strconv.FormatFloat(f, 'E', -1, 64), "-i", "./temp/%05d.jpg", "-vf", scaleStr, "-crf", "0", out)
+	err = run.Run()
+	if err != nil {
+		fmt.Println("\nerror", err)
+		err := os.RemoveAll("./temp")
+		if err != nil {
+			println(err)
+			os.Exit(1)
+		}
+	} else {
+		err := os.RemoveAll("./temp")
+		if err != nil {
+			println(err)
+			os.Exit(1)
+		}
+		fmt.Println("\nSuccess")
+	}
 }
 
 func linear(V byte) float64 {
