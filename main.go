@@ -5,12 +5,12 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	_ "image/png"
 	"math"
 	"os"
-	"os/exec"
-	"strconv"
 
-	vidio "github.com/AlexEidt/Vidio"
+	"github.com/pborman/getopt/v2"
+	"golang.org/x/image/draw"
 )
 
 var bayer = [16][16]int{
@@ -57,92 +57,96 @@ func (img ImageData) At(x, y int) color.Color {
 	return color
 }
 
+// init variables
+var (
+	outPath         = "./output.jpg"
+	scale   float32 = 1
+)
+
+func init() {
+	getopt.HelpColumn = 20
+
+	getopt.SetParameters("file")
+	getopt.FlagLong(&scale, "enlarge", 'e', "Set the factor by which pixels will be 'enlarged' (-e 4 will make 400x400 image look like 100x100)")
+	getopt.FlagLong(&outPath, "out", 'o', "Set output path")
+	optHelp := getopt.BoolLong("help", 'h', "Display help")
+
+	getopt.Parse()
+
+	if *optHelp {
+		getopt.Usage()
+		os.Exit(0)
+	} else if getopt.NArgs() != 1 {
+		fmt.Println("Error: Provide one input file")
+		fmt.Println()
+		getopt.Usage()
+		os.Exit(1)
+	}
+}
+
 func main() {
-	var scale int
 	var err error
-	switch len(os.Args) {
-	case 1:
-		fmt.Println("Error: no input/output paths provided")
-		os.Exit(1)
-	case 2:
-		fmt.Println("Error: no output path provided")
-		os.Exit(1)
-	case 3:
-		fmt.Println("Warning: no scale provided, using 1x")
-		scale = 1
-	default:
-		scale, err = strconv.Atoi(os.Args[3])
-		if err != nil {
-			fmt.Println("Scale must be an integer")
-			os.Exit(1)
-		}
-	}
-	path := os.Args[1]
-	out := os.Args[2]
 
-	video, err := vidio.NewVideo(path)
+	path := getopt.Arg(0)
+
+	f, err := os.Open(path)
 	if err != nil {
-		fmt.Println("error", err)
-	}
-	width := video.Width()
-	framesCount := int(math.Ceil(video.Duration() * video.FPS()))
-	leng := width * video.Height() * 4
-	frCounter := 0
-	img := image.NewRGBA(image.Rect(0, 0, video.Width(), video.Height()))
-	video.SetFrameBuffer(img.Pix)
-	if err := os.Mkdir("temp", os.ModePerm); err != nil {
-		fmt.Println("\n", err)
+		fmt.Println(err)
 		os.Exit(1)
 	}
-	for video.Read() {
+	defer f.Close()
 
-		f, _ := os.Create(fmt.Sprintf("./temp/%05d.jpg", frCounter))
-		frame := video.FrameBuffer()
-
-		var newFrame []byte
-		x := 0
-		y := 0
-		for i := 0; i < leng; i += 4 {
-			percLight := lightness((0.2126*linear(frame[i]) + 0.7152*linear(frame[i+1]) + 0.0722*linear(frame[i+2])))
-
-			if percLight < (float64(bayer[x%16][y%16]) / 256.0 * 100) {
-				newFrame = append(newFrame, 0, 0, 0, 255)
-			} else {
-				newFrame = append(newFrame, 255, 255, 255, 255)
-			}
-
-			if (x+1)%width != 0 {
-				x++
-			} else {
-				y++
-				x = 0
-			}
-		}
-		frCounter++
-		var newImage byteSliceAsImage = ImageData{newFrame, width}
-		jpeg.Encode(f, newImage, nil)
-		fmt.Printf("\033[2K\r%d/%d", frCounter, framesCount)
+	img, _, err := image.Decode(f)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
 	}
 
-	scaleStr := fmt.Sprintf("scale=%d*iw:%d*ih:flags=neighbor", scale, scale)
-	f := (math.Round(video.FPS()))
-	run := exec.Command("ffmpeg", "-framerate", strconv.FormatFloat(f, 'E', -1, 64), "-i", "./temp/%05d.jpg", "-vf", scaleStr, "-crf", "0", out)
-	err = run.Run()
-	if err != nil {
-		fmt.Println("\nerror", err)
-		err := os.RemoveAll("./temp")
-		if err != nil {
-			println(err)
-			os.Exit(1)
-		}
+	b := img.Bounds()
+
+	if scale != 1 {
+		dst := image.NewNRGBA(image.Rect(0, 0, int(float32(img.Bounds().Max.X)/scale), int(float32(img.Bounds().Max.Y)/scale)))
+		draw.CatmullRom.Scale(dst, dst.Rect, img, img.Bounds(), draw.Over, nil)
+		processImg(dst)
 	} else {
-		err := os.RemoveAll("./temp")
-		if err != nil {
-			println(err)
-			os.Exit(1)
-		}
-		fmt.Println("\nSuccess")
+		converted := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+		draw.Draw(converted, converted.Bounds(), img, b.Min, draw.Src)
+		processImg(converted)
 	}
+}
+
+func processImg(img *image.NRGBA) {
+	f, _ := os.Create(outPath)
+	width := img.Rect.Size().X
+	pixels := img.Pix
+	leng := len(pixels)
+
+	var newFrame []byte
+	x := 0
+	y := 0
+	for i := 0; i < leng; i += 4 {
+		percLight := lightness((0.2126*linear(pixels[i]) + 0.7152*linear(pixels[i+1]) + 0.0722*linear(pixels[i+2])))
+
+		if percLight < (float64(bayer[x%16][y%16]) / 256.0 * 100) {
+			newFrame = append(newFrame, 0, 0, 0, 255)
+		} else {
+			newFrame = append(newFrame, 255, 255, 255, 255)
+		}
+
+		if (x+1)%width != 0 {
+			x++
+		} else {
+			y++
+			x = 0
+		}
+	}
+	var newImage byteSliceAsImage = ImageData{newFrame, width}
+	if scale != 1 {
+		dst := image.NewRGBA(image.Rect(0, 0, int(float32(img.Bounds().Max.X)*scale), int(float32(img.Bounds().Max.Y)*scale)))
+		draw.NearestNeighbor.Scale(dst, dst.Rect, newImage, newImage.Bounds(), draw.Over, nil)
+		newImage = dst
+	}
+	jpeg.Encode(f, newImage, nil)
 }
 
 func linear(V byte) float64 {
